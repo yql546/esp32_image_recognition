@@ -1,9 +1,10 @@
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <WiFiUdp.h>
 
 #include "esp_heap_caps.h"
 
-#include <ESP32Servo.h>
+ 
 
 // 覆盖 Edge Impulse 的 weak 分配函数：让 TFLite 的 tensor arena(约 327KB) 落在 PSRAM
 // 注意：EI 未定义 EI_C_LINKAGE，这两个符号是 C++ 链接，所以这里不要加 extern "C"
@@ -62,6 +63,33 @@ void *ei_malloc(size_t size) {
 // ===========================
 const char *ssid = "荣耀400";
 const char *password = "20061031";
+
+// ============ UDP 指令发送（与机械臂板 B 约定）============
+#define ARM_BOARD_IP     "10.191.178.220"  // B板静态IP【按和队友约定的实际IP填】
+#define ARM_BOARD_PORT   8888
+#define LOCAL_UDP_PORT   8889              // 本机只发不收
+#define COOL_DOWN_MS     2500              // 指令冷却：2.5s 内不重复发送
+
+// 发送策略：只在“识别结果发生变化”时发一次，机械臂不会一直动
+#define ALLOW_SAME_CMD_REPEAT  0           // 0=同一表情只触发一次；1=识别失效(0)后允许再次触发
+// 置信度上限（可选兜底）：>0 时，置信度 >= 该值视为“无人脸/不可信”，不发指令
+// 注意：真的 sleepy 表情也可能 >0.9，设之前先测数据。0 = 关闭
+#define SCORE_MAX_VALID  0.00f
+
+WiFiUDP udp;
+
+extern volatile int   g_emotion_cmd;       // 来自 edge_impulse.cpp：0=无有效识别 1=开心 2=不开心
+extern volatile float g_emotion_score;
+
+int  lastSentCmd  = 0;      // 上一次实际发出的指令（边沿触发用）
+unsigned long lastSendMs = 0;
+
+void sendEmotionCmd(int cmd) {
+  udp.beginPacket(ARM_BOARD_IP, ARM_BOARD_PORT);
+  udp.write((uint8_t)cmd);
+  udp.endPacket();
+  Serial.printf("UDP发送指令: %d\n", cmd);
+}
 
 bool bOn = false;
 
@@ -175,6 +203,10 @@ void setup() {
   Serial.println("");
   Serial.println("WiFi connected");
 
+  udp.begin(LOCAL_UDP_PORT);
+  Serial.printf("视觉板A IP: %s  -> 目标 %s:%d\n",
+                WiFi.localIP().toString().c_str(), ARM_BOARD_IP, ARM_BOARD_PORT);
+
   startCameraServer();
 
   Serial.print("Camera Ready! Use 'http://");
@@ -213,8 +245,33 @@ void loop() {
   Serial.printf("fb buf=%p len=%u fmt=%d %ux%u\n",
                 fb->buf, (unsigned)fb->len, (int)fb->format, fb->width, fb->height);
 
-  ei_edge_impulse(fb);
+  ei_edge_impulse(fb);            // 原有推理，阻塞约 6.3 秒
 
   esp_camera_fb_return(fb);   // 只释放一次
-  delay(100);
-}
+
+  // ---- 发送策略：只在“识别结果发生变化”时发一次，避免机械臂一直运动 ----
+  int   cmd   = g_emotion_cmd;
+  float score = g_emotion_score;
+
+  // 可选兜底：置信度过高时按“无人脸/不可信”处理（SCORE_MAX_VALID=0 表示关闭）
+  if (SCORE_MAX_VALID > 0.0f && cmd != 0 && score >= SCORE_MAX_VALID) {
+    Serial.printf("置信度 %.3f >= %.2f，按无人脸处理，不发送\n",
+                  (double)score, (double)SCORE_MAX_VALID);
+    cmd = 0;
+  }
+
+  // 边沿触发：只有指令相对“上次已发”发生变化时才发；搭配冷却防止刷屏
+  unsigned long now = millis();
+  if (cmd != 0 && cmd != lastSentCmd && (now - lastSendMs >= COOL_DOWN_MS)) {
+    sendEmotionCmd(cmd);
+    lastSentCmd = cmd;
+    lastSendMs  = now;
+  } else if (cmd == 0 && ALLOW_SAME_CMD_REPEAT) {
+    lastSentCmd = 0;   // 识别失效后复位，同一种表情可以再次触发
+  }
+
+  Serial.printf("识别: %s  cmd=%d  score=%.3f  上次已发=%d\n",
+                cmd == 1 ? "peaceful(开心)" : (cmd == 2 ? "sleepy(不开心)" : "无有效识别"),
+                cmd, (double)score, lastSentCmd);
+
+  // 推理一帧约 6.5 秒，这里不需要额外延时
