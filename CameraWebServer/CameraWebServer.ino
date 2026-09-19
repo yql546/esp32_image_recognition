@@ -1,3 +1,4 @@
+//优化控制指令：仅仅当表情不一致，才会下方运动指令。
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
